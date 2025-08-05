@@ -4,6 +4,8 @@ import logging
 from typing import Dict, Optional, List, Tuple
 from datetime import datetime
 import json
+from dotenv import load_dotenv
+load_dotenv()
 import os
 from dataclasses import dataclass
 import time
@@ -241,7 +243,7 @@ class ChannelMonitor:
     async def initialize(self):
         """Initialize Telegram client"""
         try:
-            await self.client.start(phone=self.phone)
+            await self.client.start(phone=self.phone, code_callback=lambda: input("Enter the code: "))
             logger.info("Channel monitor initialized successfully")
             return True
         except Exception as e:
@@ -269,6 +271,27 @@ class ChannelMonitor:
                 
         except Exception as e:
             logger.error(f"Error adding channel {channel_username}: {e}")
+            return False
+    
+    async def remove_channel(self, channel_username: str) -> bool:
+        """Remove channel from monitoring list"""
+        try:
+            # Normalize channel username
+            if not channel_username.startswith('@'):
+                channel_username = '@' + channel_username
+                
+            # Find and remove channel
+            for channel in self.monitored_channels[:]:  # Copy list to avoid modification issues
+                if channel['username'] == channel_username:
+                    self.monitored_channels.remove(channel)
+                    logger.info(f"Removed channel: {channel['title']} (@{channel_username})")
+                    return True
+                    
+            logger.warning(f"Channel not found: {channel_username}")
+            return False
+                
+        except Exception as e:
+            logger.error(f"Error removing channel {channel_username}: {e}")
             return False
     
     def set_signal_callback(self, callback):
@@ -628,65 +651,420 @@ class EnhancedBybitTrader:
         return daily_loss
 
 class AutoTradingBot:
-    """Main auto-trading bot with AI signal detection"""
-    
+    """Main auto-trading bot with AI signal detection - FIXED VERSION with new features"""
+
     def __init__(self, telegram_token: str, openai_api_key: str, telegram_api_id: int, 
                  telegram_api_hash: str, phone_number: str):
         self.config_manager = ConfigManager()
         self.signal_analyzer = AISignalAnalyzer(openai_api_key)
         self.channel_monitor = ChannelMonitor(telegram_api_id, telegram_api_hash, phone_number, self.signal_analyzer)
-        
+
         # Set up signal callback
         self.channel_monitor.set_signal_callback(self.handle_detected_signal)
-        
+
         # Telegram bot for admin commands
         self.admin_app = Application.builder().token(telegram_token).build()
-        self.setup_admin_handlers()
         
         # Active traders
         self.active_traders = {}
         
+        # Setup handlers AFTER initialization
+        self.setup_admin_handlers()
+
     def setup_admin_handlers(self):
-        """Setup admin command handlers"""
-        self.admin_app.add_handler(CommandHandler("start", self.admin_start))
-        self.admin_app.add_handler(CommandHandler("add_channel", self.add_channel_command))
-        self.admin_app.add_handler(CommandHandler("add_user", self.add_user_command))
-        self.admin_app.add_handler(CommandHandler("status", self.status_command))
-        self.admin_app.add_handler(CommandHandler("stop_trading", self.stop_trading_command))
+        """Set up admin command handlers with new features"""
         
-    async def handle_detected_signal(self, signal: TradingSignal, channel_info: Dict):
-        """Handle AI-detected trading signal"""
-        try:
-            logger.info(f"Processing signal: {signal.direction} {signal.symbol} (Confidence: {signal.confidence_score}%)")
+        async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"📱 /start received from user {update.effective_user.id}")
+            try:
+                response = (
+                    f"🤖 Auto-Trading Bot Admin Panel\n"
+                    f"✅ Status: Bot is online and working!\n"
+                    f"👤 Your Telegram ID: {update.effective_user.id}\n\n"
+                    f"**Available Commands:**\n"
+                    f"/add_channel @username - Add channel to monitor\n"
+                    f"/remove_channel @username - Remove channel from monitoring\n"
+                    f"/add_user user_id api_key api_secret - Add user for trading\n"
+                    f"/remove_user user_id - Remove user and their credentials\n"
+                    f"/toggle_auto_trading - Toggle auto-trading on/off\n"
+                    f"/set_risk percentage - Set risk percentage per trade (0-5)\n"
+                    f"/status - Show bot status and statistics\n"
+                    f"/stop_trading - Emergency stop all auto-trading\n\n"
+                    f"📋 Next Steps:\n"
+                    f"1. Add trading channels with /add_channel\n"
+                    f"2. Add users with API keys using /add_user\n"
+                    f"3. Monitor with /status\n\n"
+                    f"⚠️ Important: Start with testnet trading!"
+                )
+                await update.message.reply_text(response, parse_mode='Markdown')
+                logger.info("✅ Start response sent successfully")
+            except Exception as e:
+                logger.error(f"❌ Error in start handler: {str(e)}")
+                await update.message.reply_text("❌ Error occurred. Please try again.")
+
+        async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"📊 /status received from user {update.effective_user.id}")
+            try:
+                channels_count = len(self.channel_monitor.monitored_channels)
+                users_count = len([u for u in self.config_manager.config.get('users', {}).values() if u.get('auto_trade')])
+                user_config = self.config_manager.get_user_config(update.effective_user.id)
+                auto_trade_status = user_config.get('auto_trade', False) if user_config else False
+                risk_percentage = user_config.get('risk', 3.0) if user_config else 3.0
+                
+                status_message = f"""
+📊 **Bot Status Report**
+
+🔍 **Monitored Channels**: {channels_count}
+👥 **Active Users**: {users_count}
+🤖 **AI Analyzer**: ✅ Ready
+📡 **Channel Monitor**: ✅ Running
+⚡ **Your Auto-Trading**: {'✅ Enabled' if auto_trade_status else '⏸️ Disabled'}
+💰 **Your Risk %**: {risk_percentage}%
+
+**System Info:**
+🆔 **Your ID**: `{update.effective_user.id}`
+🕐 **Bot Uptime**: Active
+🔗 **Connection**: ✅ Stable
+
+**Usage:**
+• Add channels: `/add_channel @channel_name`
+• Remove channels: `/remove_channel @channel_name`
+• Add users: `/add_user USER_ID API_KEY API_SECRET`
+• Remove user: `/remove_user USER_ID`
+• Toggle auto-trading: `/toggle_auto_trading`
+• Set risk: `/set_risk PERCENTAGE` (0-5)
+                """
+                await update.message.reply_text(status_message, parse_mode='Markdown')
+                logger.info("✅ Status response sent successfully")
+            except Exception as e:
+                logger.error(f"❌ Error in status handler: {e}")
+                await update.message.reply_text("❌ Error getting status. Please try again.")
+
+        async def toggle_auto_trading_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"⚡ /toggle_auto_trading received from user {update.effective_user.id}")
+            try:
+                user_id = update.effective_user.id
+                user_config = self.config_manager.get_user_config(user_id)
+                
+                if not user_config:
+                    await update.message.reply_text("❌ You are not a registered user. Use /add_user to register.")
+                    return
+                
+                new_status = not user_config.get('auto_trade', False)
+                if self.config_manager.update_user_setting(user_id, 'auto_trade', new_status):
+                    await update.message.reply_text(f"✅ Auto-trading {'enabled' if new_status else 'disabled'} successfully!")
+                    logger.info(f"✅ Auto-trading {'enabled' if new_status else 'disabled'} for user {user_id}")
+                else:
+                    await update.message.reply_text("❌ Failed to toggle auto-trading. Try again.")
+            except Exception as e:
+                logger.error(f"❌ Error in toggle_auto_trading handler: {str(e)}")
+                await update.message.reply_text("❌ Error occurred. Please try again.")
+
+        async def set_risk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"💰 /set_risk received from user {update.effective_user.id}, args: {context.args}")
+            try:
+                if len(context.args) != 1:
+                    await update.message.reply_text("❌ Invalid Usage\n\n**Correct format:**\n`/set_risk PERCENTAGE` (0-5)\n\n**Example:**\n`/set_risk 2.5`")
+                    return
+                
+                risk_percentage = float(context.args[0])
+                max_risk = self.config_manager.config['risk_management']['max_risk']
+                
+                if risk_percentage < 0 or risk_percentage > max_risk:
+                    await update.message.reply_text(f"❌ Risk must be between 0 and {max_risk}%. Try again.")
+                    return
+                
+                user_id = update.effective_user.id
+                if self.config_manager.update_user_setting(user_id, 'risk', risk_percentage):
+                    await update.message.reply_text(f"✅ Risk percentage set to {risk_percentage}% successfully!")
+                    logger.info(f"✅ Risk percentage set to {risk_percentage}% for user {user_id}")
+                else:
+                    await update.message.reply_text("❌ Failed to set risk percentage. Try again.")
+            except ValueError:
+                await update.message.reply_text("❌ Please enter a valid number for risk percentage.")
+            except Exception as e:
+                logger.error(f"❌ Error in set_risk handler: {str(e)}")
+                await update.message.reply_text("❌ Error occurred. Please try again.")
+
+        async def remove_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"👤 /remove_user received from user {update.effective_user.id}, args: {context.args}")
+            try:
+                if len(context.args) != 1:
+                    await update.message.reply_text("❌ Invalid Usage\n\n**Correct format:**\n`/remove_user USER_ID`\n\n**Example:**\n`/remove_user 1960045595`")
+                    return
+                
+                user_id = int(context.args[0])
+                if str(user_id) in self.config_manager.config.get('users', {}):
+                    del self.config_manager.config['users'][str(user_id)]
+                    self.config_manager.save_config()
+                    if user_id in self.active_traders:
+                        del self.active_traders[user_id]
+                    await update.message.reply_text(f"✅ User {user_id} removed successfully!")
+                    logger.info(f"✅ User {user_id} removed by admin")
+                else:
+                    await update.message.reply_text(f"❌ User {user_id} not found.")
+            except ValueError:
+                await update.message.reply_text("❌ Please enter a valid user ID.")
+            except Exception as e:
+                logger.error(f"❌ Error in remove_user handler: {str(e)}")
+                await update.message.reply_text("❌ Error occurred. Please try again.")
+
+        async def add_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"📢 /add_channel received from user {update.effective_user.id}, args: {context.args}")
+            if len(context.args) != 1:
+                await update.message.reply_text("""
+❌ **Invalid Usage**
+
+**Correct format:**
+`/add_channel @channel_username`
+
+**Examples:**
+`/add_channel @crypto_signals_pro`
+`/add_channel @trading_signals_vip`
+
+**Note**: Channel must be public or you must be a member.
+                """, parse_mode='Markdown')
+                return
+                
+            channel_username = context.args[0]
+            if not channel_username.startswith('@'):
+                channel_username = '@' + channel_username
             
-            # Execute trades for all active users
+            try:
+                await update.message.reply_text(f"🔄 **Adding channel...**\n\nChannel: `{channel_username}`\nPlease wait...", parse_mode='Markdown')
+                success = await self.channel_monitor.add_channel(channel_username)
+                if success:
+                    self.config_manager.add_channel(channel_username)
+                    await update.message.reply_text(f"""
+✅ **Channel Added Successfully!**
+
+📢 **Channel**: `{channel_username}`
+🔍 **Status**: Now monitoring for trading signals
+📊 **AI Analysis**: Enabled
+
+The bot will now analyze all messages from this channel using AI and execute trades automatically for enabled users.
+                    """, parse_mode='Markdown')
+                    logger.info(f"✅ Channel {channel_username} added successfully")
+                else:
+                    await update.message.reply_text(f"""
+❌ **Failed to Add Channel**
+
+**Channel**: `{channel_username}`
+
+**Possible reasons:**
+• Channel doesn't exist
+• Channel is private and bot has no access
+• Invalid channel format
+• Network error
+
+**Solutions:**
+• Check channel username is correct
+• Make sure channel is public
+• Try again in a few minutes
+                    """, parse_mode='Markdown')
+                    logger.error(f"❌ Failed to add channel {channel_username}")
+            except Exception as e:
+                logger.error(f"❌ Error in add_channel handler: {e}")
+                await update.message.reply_text(f"❌ **Error**: {str(e)}", parse_mode='Markdown')
+
+        async def remove_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"📴 /remove_channel received from user {update.effective_user.id}, args: {context.args}")
+            if len(context.args) != 1:
+                await update.message.reply_text("""
+❌ **Invalid Usage**
+
+**Correct format:**
+`/remove_channel @channel_username`
+
+**Examples:**
+`/remove_channel @crypto_signals_pro`
+`/remove_channel @trading_signals_vip`
+                """, parse_mode='Markdown')
+                return
+                
+            channel_username = context.args[0]
+            if not channel_username.startswith('@'):
+                channel_username = '@' + channel_username
+            
+            try:
+                await update.message.reply_text(f"🔄 **Removing channel...**\n\nChannel: `{channel_username}`\nPlease wait...", parse_mode='Markdown')
+                success = await self.channel_monitor.remove_channel(channel_username)
+                if success:
+                    if channel_username in self.config_manager.config['channels']:
+                        del self.config_manager.config['channels'][channel_username]
+                        self.config_manager.save_config()
+                    await update.message.reply_text(f"""
+✅ **Channel Removed Successfully!**
+
+📢 **Channel**: `{channel_username}`
+🔍 **Status**: No longer monitored
+📊 **AI Analysis**: Disabled for this channel
+
+The bot will stop monitoring this channel for trading signals.
+                    """, parse_mode='Markdown')
+                    logger.info(f"✅ Channel {channel_username} removed successfully")
+                else:
+                    await update.message.reply_text(f"""
+❌ **Failed to Remove Channel**
+
+**Channel**: `{channel_username}`
+
+**Possible reasons:**
+• Channel is not currently monitored
+• Invalid channel format
+• Network error
+
+**Solutions:**
+• Check channel username is correct
+• Verify channel is in monitored list with /status
+• Try again in a few minutes
+                    """, parse_mode='Markdown')
+                    logger.error(f"❌ Failed to remove channel {channel_username}")
+            except Exception as e:
+                logger.error(f"❌ Error in remove_channel handler: {e}")
+                await update.message.reply_text(f"❌ **Error**: {str(e)}", parse_mode='Markdown')
+
+        async def add_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"👤 /add_user received from user {update.effective_user.id}")
+            if len(context.args) != 3:
+                await update.message.reply_text("""
+❌ **Invalid Usage**
+
+**Correct format:**
+`/add_user USER_ID API_KEY API_SECRET`
+
+**Example:**
+`/add_user 123456789 K2Pv7nQxRmJ8s X9mN4bV7cQ2w`
+
+**How to get your User ID:**
+Send a message to @userinfobot
+
+**How to get Bybit API keys:**
+1. Login to Bybit
+2. Go to Account & Security → API Management  
+3. Create new API key with trading permissions
+                """, parse_mode='Markdown')
+                return
+
+            user_id, api_key, api_secret = context.args
+            try:
+                await update.message.reply_text("🔄 **Validating API credentials...**\nPlease wait...")
+                trader = EnhancedBybitTrader(api_key, api_secret, testnet=True)
+                balance = await trader.get_account_balance()
+                if balance:
+                    self.config_manager.add_user(int(user_id), api_key, api_secret)
+                    await update.message.reply_text(f"""
+✅ **User Added Successfully!**
+
+👤 **User ID**: `{user_id}`
+🔑 **API**: ✅ Valid credentials
+🧪 **Mode**: Testnet (recommended for start)
+⚡ **Auto-Trading**: ❌ Disabled (enable manually)
+
+**Next Steps:**
+1. Test with `/status` to confirm setup
+2. Enable auto-trading with `/toggle_auto_trading`
+3. Monitor bot performance
+
+**Important**: Auto-trading starts disabled for safety!
+                    """, parse_mode='Markdown')
+                    logger.info(f"✅ User {user_id} added successfully")
+                else:
+                    await update.message.reply_text("""
+❌ **Invalid API Credentials**
+
+**Possible issues:**
+• Wrong API key or secret
+• API key lacks trading permissions
+• API key is for wrong environment (testnet/mainnet)
+
+**How to fix:**
+1. Check API key and secret are correct
+2. Ensure API has derivatives trading permission
+3. Try creating new API key
+                    """, parse_mode='Markdown')
+                    logger.error(f"❌ Invalid API credentials for user {user_id}")
+            except Exception as e:
+                logger.error(f"❌ Error in add_user handler: {e}")
+                await update.message.reply_text(f"❌ **Error**: {str(e)}", parse_mode='Markdown')
+
+        async def stop_trading_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.info(f"🚨 /stop_trading received from user {update.effective_user.id}")
+            try:
+                disabled_count = 0
+                for user_id in self.config_manager.config.get('users', {}):
+                    if self.config_manager.update_user_setting(int(user_id), 'auto_trade', False):
+                        disabled_count += 1
+                await update.message.reply_text(f"""
+🚨 **EMERGENCY STOP ACTIVATED**
+
+⛔ **Auto-trading disabled for {disabled_count} users**
+🛑 **All pending signals ignored**
+📊 **Channel monitoring continues**
+
+**Status**: Bot will continue monitoring channels but won't execute any trades.
+
+**To re-enable**: Use `/toggle_auto_trading` for individual users.
+                """, parse_mode='Markdown')
+                logger.info(f"🚨 Emergency stop activated by user {update.effective_user.id}")
+            except Exception as e:
+                logger.error(f"❌ Error in stop_trading handler: {e}")
+                await update.message.reply_text(f"❌ Error stopping trading: {str(e)}")
+
+        async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logger.error(f"❌ Bot error: {context.error}")
+            if update and update.message:
+                try:
+                    await update.message.reply_text("❌ An unexpected error occurred. Please try again or contact support.")
+                except:
+                    pass
+
+        # Register all handlers
+        self.admin_app.add_handler(CommandHandler("start", start_handler))
+        self.admin_app.add_handler(CommandHandler("status", status_handler))
+        self.admin_app.add_handler(CommandHandler("toggle_auto_trading", toggle_auto_trading_handler))
+        self.admin_app.add_handler(CommandHandler("set_risk", set_risk_handler))
+        self.admin_app.add_handler(CommandHandler("remove_user", remove_user_handler))
+        self.admin_app.add_handler(CommandHandler("add_channel", add_channel_handler))
+        self.admin_app.add_handler(CommandHandler("remove_channel", remove_channel_handler))
+        self.admin_app.add_handler(CommandHandler("add_user", add_user_handler))
+        self.admin_app.add_handler(CommandHandler("stop_trading", stop_trading_handler))
+        self.admin_app.add_error_handler(error_handler)
+        
+        logger.info("✅ All admin handlers registered successfully")
+
+    async def handle_detected_signal(self, signal: TradingSignal, channel_info: Dict):
+        """Handle detected trading signals"""
+        try:
+            logger.info(f"🎯 Processing signal: {signal.direction} {signal.symbol} (Confidence: {signal.confidence_score}%)")
+            
+            executed_count = 0
             for user_id, user_config in self.config_manager.config.get('users', {}).items():
                 if not user_config.get('auto_trade', False):
                     continue
-                
+
                 if user_id not in self.active_traders:
                     self.active_traders[user_id] = EnhancedBybitTrader(
                         user_config['api_key'],
                         user_config['api_secret'],
                         user_config.get('testnet', False)
                     )
-                
+
                 trader = self.active_traders[user_id]
-                
-                # Execute trade automatically
                 result = await trader.execute_signal_automatically(signal, user_config)
-                
-                # Log result
+
                 if result['success']:
-                    logger.info(f"Trade executed for user {user_id}: {result['message']}")
-                    # Optionally send notification to user
+                    logger.info(f"✅ Trade executed for user {user_id}: {result['message']}")
                     await self.send_trade_notification(user_id, signal, result)
+                    executed_count += 1
                 else:
-                    logger.error(f"Trade failed for user {user_id}: {result['error']}")
-                    
+                    logger.error(f"❌ Trade failed for user {user_id}: {result['error']}")
+
+            logger.info(f"📊 Signal processing complete. Trades executed: {executed_count}")
+
         except Exception as e:
-            logger.error(f"Error handling detected signal: {e}")
-    
+            logger.error(f"❌ Error handling detected signal: {e}")
+
     async def send_trade_notification(self, user_id: str, signal: TradingSignal, result: Dict):
         """Send trade notification to user"""
         try:
@@ -704,119 +1082,55 @@ Position Size: {result.get('position_size', 'N/A')}
 Status: ✅ Success
 
 ⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Use /status to check overall performance.
             """
-            
-            # Send to user (you'll need to implement this based on your notification preference)
             await self.admin_app.bot.send_message(chat_id=int(user_id), text=message, parse_mode='Markdown')
-            
+            logger.info(f"📤 Trade notification sent to user {user_id}")
         except Exception as e:
-            logger.error(f"Error sending notification: {e}")
-    
-    # Admin command handlers
-    async def admin_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Admin start command"""
-        await update.message.reply_text("""
-🤖 **Auto-Trading Bot Admin Panel**
+            logger.error(f"❌ Error sending notification to {user_id}: {e}")
 
-Commands:
-/add_channel <username> - Add channel to monitor
-/add_user <user_id> <api_key> <api_secret> - Add user for auto-trading
-/status - Show bot status
-/stop_trading - Emergency stop all trading
-""", parse_mode='Markdown')
-    
-    async def add_channel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Add channel to monitoring"""
-        if len(context.args) != 1:
-            await update.message.reply_text("Usage: /add_channel <channel_username>")
-            return
-        
-        channel_username = context.args[0]
-        success = await self.channel_monitor.add_channel(channel_username)
-        
-        if success:
-            await update.message.reply_text(f"✅ Channel {channel_username} added successfully!")
-        else:
-            await update.message.reply_text(f"❌ Failed to add channel {channel_username}")
-    
-    async def add_user_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Add user for auto-trading"""
-        if len(context.args) != 3:
-            await update.message.reply_text("Usage: /add_user <user_id> <api_key> <api_secret>")
-            return
-        
-        user_id, api_key, api_secret = context.args
-        
-        try:
-            # Test API credentials
-            trader = EnhancedBybitTrader(api_key, api_secret, testnet=True)
-            balance = await trader.get_account_balance()
-            
-            if balance:
-                self.config_manager.add_user(int(user_id), api_key, api_secret)
-                self.config_manager.update_user_setting(int(user_id), 'auto_trade', True)
-                await update.message.reply_text(f"✅ User {user_id} added successfully for auto-trading!")
-            else:
-                await update.message.reply_text("❌ Invalid API credentials!")
-                
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-    
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show bot status"""
-        status_message = f"""
-📊 **Bot Status**
-
-🔍 **Monitored Channels:** {len(self.channel_monitor.monitored_channels)}
-👥 **Active Users:** {len([u for u in self.config_manager.config.get('users', {}).values() if u.get('auto_trade')])}
-🤖 **AI Analyzer:** ✅ Active
-⚡ **Auto Trading:** ✅ Enabled
-
-📈 **Recent Activity:**
-- Signals processed today: {len([t for t in getattr(self, 'processed_signals', []) if t.timestamp.date() == datetime.now().date()])}
-- Trades executed today: {len([t for trader in self.active_traders.values() for t in trader.trade_history if t['timestamp'].date() == datetime.now().date()])}
-        """
-        
-        await update.message.reply_text(status_message, parse_mode='Markdown')
-    
-    async def stop_trading_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Emergency stop all trading"""
-        try:
-            # Disable auto trading for all users
-            for user_id in self.config_manager.config.get('users', {}):
-                self.config_manager.update_user_setting(int(user_id), 'auto_trade', False)
-            
-            await update.message.reply_text("🚨 **EMERGENCY STOP ACTIVATED**\n\nAll auto-trading has been disabled!", parse_mode='Markdown')
-            
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error stopping trading: {str(e)}")
-    
     async def run(self):
-        """Start the bot"""
+        """Run the auto-trading bot - FIXED VERSION"""
         try:
-            logger.info("Initializing Auto-Trading Bot...")
-            
-            # Initialize channel monitor
+            logger.info("🚀 Initializing Auto-Trading Bot...")
+
+            # Initialize channel monitor first
+            logger.info("📡 Initializing channel monitor...")
             if not await self.channel_monitor.initialize():
                 raise Exception("Failed to initialize channel monitor")
-            
-            # Start admin bot in background
-            admin_task = asyncio.create_task(self.admin_app.initialize())
-            
-            # Start channel monitoring
-            monitor_task = asyncio.create_task(self.channel_monitor.start_monitoring())
-            
-            logger.info("🚀 Auto-Trading Bot started successfully!")
-            logger.info("📡 Monitoring channels for AI-detected signals...")
-            logger.info("🤖 Ready for automatic trade execution!")
-            
-            # Run both tasks concurrently
-            await asyncio.gather(admin_task, monitor_task)
-            
-        except Exception as e:
-            logger.error(f"Error starting bot: {e}")
-            raise
+            logger.info("✅ Channel monitor ready")
 
+            # Start admin bot
+            logger.info("🤖 Starting admin interface...")
+            
+            async with self.admin_app:
+                await self.admin_app.initialize()
+                await self.admin_app.start()
+                await self.admin_app.updater.start_polling()
+                
+                logger.info("✅ Admin bot is running and ready for commands!")
+                logger.info("📱 You can now use the bot in Telegram")
+                
+                # Start channel monitoring in background
+                logger.info("🔍 Starting channel monitoring...")
+                monitor_task = asyncio.create_task(self.channel_monitor.start_monitoring())
+                
+                logger.info("🎉 Auto-Trading Bot fully operational!")
+                logger.info("💡 Send /start to your bot in Telegram to begin")
+                
+                # Keep running
+                try:
+                    await monitor_task
+                except KeyboardInterrupt:
+                    logger.info("👋 Shutting down bot...")
+                    await self.admin_app.stop()
+
+        except Exception as e:
+            logger.error(f"❌ Error starting bot: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
 # Enhanced Configuration Manager
 class ConfigManager:
@@ -838,14 +1152,14 @@ class ConfigManager:
             },
             'risk_management': {
                 'default_leverage': 10,
-                'default_risk': 3.0,  # More conservative for auto-trading
-                'max_leverage': 25,   # Lower max for safety
-                'max_risk': 5.0,      # Lower max for safety
-                'max_daily_loss': 100,  # USD
+                'default_risk': 3.0,
+                'max_leverage': 25,
+                'max_risk': 5.0,
+                'max_daily_loss': 100,
                 'max_concurrent_trades': 3
             },
             'trading_hours': {
-                'enabled': False,  # 24/7 by default for crypto
+                'enabled': False,
                 'start_hour': 0,
                 'end_hour': 23
             }
@@ -854,7 +1168,6 @@ class ConfigManager:
         try:
             with open(self.config_file, 'r') as f:
                 loaded_config = yaml.safe_load(f) or {}
-                # Merge with defaults
                 default_config.update(loaded_config)
                 return default_config
         except FileNotFoundError:
@@ -872,11 +1185,11 @@ class ConfigManager:
             'api_secret': api_secret,
             'leverage': self.config['risk_management']['default_leverage'],
             'risk': self.config['risk_management']['default_risk'],
-            'auto_trade': False,  # Starts disabled for safety
-            'testnet': True,      # Start with testnet
+            'auto_trade': False,
+            'testnet': True,
             'max_daily_loss': self.config['risk_management']['max_daily_loss'],
             'max_concurrent_trades': self.config['risk_management']['max_concurrent_trades'],
-            'enabled_symbols': ['BTCUSDT', 'ETHUSDT'],  # Start with major pairs
+            'enabled_symbols': ['BTCUSDT', 'ETHUSDT'],
             'created_at': datetime.now().isoformat()
         }
         self.save_config()
@@ -916,7 +1229,6 @@ class ConfigManager:
             if signal_detected:
                 channel['signal_count'] += 1
             if success is not None:
-                # Update success rate calculation
                 pass
             self.save_config()
 
