@@ -16,6 +16,8 @@ from telethon.tl.types import Channel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from dataclasses import field
+
 @dataclass
 class TradingSignal:
     direction: str
@@ -26,6 +28,7 @@ class TradingSignal:
     stop_loss: float = 0
     leverage: int = 10
     original_message: str = ""
+    timestamp: datetime = field(default_factory=datetime.now)
 
 class BybitTrader:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
@@ -101,10 +104,12 @@ class BybitTrader:
                     symbol=signal.symbol,
                     side="Sell" if side == "Buy" else "Buy",
                     orderType="Stop",
-                    stopLoss=str(signal.stop_loss),
+                    stopPrice=str(signal.stop_loss),
+                    basePrice=str(order_price),
                     qty=str(round(quantity, 4)),
                     timeInForce="GoodTillCancel",
-                    reduceOnly=True
+                    reduceOnly=True,
+                    triggerBy="LastPrice"
                 )
             
             # Track position
@@ -112,7 +117,13 @@ class BybitTrader:
                 'order_id': order_id,
                 'entry_price': order_price,
                 'quantity': quantity,
-                'side': side
+                'side': side,
+                'timestamp': datetime.now(),
+                'take_profits': signal.take_profit,
+                'stop_loss': signal.stop_loss,
+                'leverage': signal.leverage,
+                'realized_pnl': 0.0,
+                'unrealized_pnl': 0.0
             }
             
             return {
@@ -158,8 +169,22 @@ class BybitTrader:
             
     async def _calculate_position_size(self, signal: TradingSignal, market_data: Dict, 
                                      balance: float, risk_pct: float) -> float:
-        # Calculate base position size
-        position_size = (balance * risk_pct * 0.01 * signal.leverage) / market_data['price']
+        # Calculate stop loss distance
+        if not signal.entry_price or not signal.stop_loss:
+            return 0
+            
+        sl_distance = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
+        if sl_distance == 0:
+            return 0
+            
+        # Calculate risk amount in USDT
+        risk_amount = balance * (risk_pct / 100)
+        
+        # Calculate position size based on stop loss
+        position_size = risk_amount / (sl_distance * market_data['price'])
+        
+        # Apply leverage
+        position_size *= signal.leverage
         
         # Adjust based on volatility
         price_change = abs(market_data['price'] - market_data['bid']) / market_data['price']
@@ -167,6 +192,42 @@ class BybitTrader:
             position_size *= 0.5  # Reduce position size for volatile markets
             
         return position_size
+        
+    async def update_position_pnl(self) -> None:
+        """Update PnL for all active positions"""
+        for symbol, position in list(self.active_positions.items()):
+            try:
+                market_data = await self._get_market_data(symbol)
+                if not market_data:
+                    continue
+                
+                current_price = market_data['price']
+                price_diff = current_price - position['entry_price']
+                if position['side'] == "Sell":
+                    price_diff = -price_diff
+                    
+                # Calculate unrealized PnL
+                position['unrealized_pnl'] = price_diff * position['quantity']
+                
+                # Check if stop loss or take profit hit
+                if position['side'] == "Buy":
+                    if current_price <= position['stop_loss'] or \
+                       current_price >= min(position['take_profits']):
+                        position['realized_pnl'] = position['unrealized_pnl']
+                        del self.active_positions[symbol]
+                else:  # Sell position
+                    if current_price >= position['stop_loss'] or \
+                       current_price <= max(position['take_profits']):
+                        position['realized_pnl'] = position['unrealized_pnl']
+                        del self.active_positions[symbol]
+                        
+                # Update daily PnL
+                self.daily_pnl = sum(p['realized_pnl'] + p['unrealized_pnl'] 
+                                   for p in self.active_positions.values())
+                
+            except Exception as e:
+                logger.error(f"Error updating PnL for {symbol}: {e}")
+                continue
 
 class TradingBot:
     def __init__(self):
@@ -180,8 +241,15 @@ class TradingBot:
         
         # Setup components
         openai.api_key = self.openai_key
-        self.client = TelegramClient('session', self.api_id, self.api_hash)
+        
+        # Initialize Telegram client with proper session handling
+        session_file = os.path.join(os.path.dirname(__file__), 'trading_bot.session')
+        self.client = TelegramClient(session_file, self.api_id, self.api_hash)
+        
+        # Initialize admin bot
         self.admin_app = Application.builder().token(self.bot_token).build()
+        
+        logger.info("Components initialized successfully")
         
         # Trading configuration
         self.users = {}  # {user_id: {'api_key': str, 'api_secret': str, 'enabled': bool}}
@@ -196,9 +264,18 @@ class TradingBot:
         self.trade_history = {}  # Track trades and performance
         
         # Setup command handlers
-        for cmd in [('start', self.cmd_start), ('add_user', self.cmd_add_user), 
-                   ('add_channel', self.cmd_add_channel)]:
-            self.admin_app.add_handler(CommandHandler(cmd[0], cmd[1]))
+        commands = [
+            ('start', self.cmd_start),
+            ('add_user', self.cmd_add_user),
+            ('add_channel', self.cmd_add_channel),
+            ('status', self.cmd_status),
+            ('list_channels', self.cmd_list_channels),
+            ('check_connection', self.cmd_check_connection)
+        ]
+        for cmd_name, cmd_handler in commands:
+            self.admin_app.add_handler(CommandHandler(cmd_name, cmd_handler))
+            
+        logger.info("Command handlers registered")
 
     async def analyze_message(self, message: str) -> Optional[TradingSignal]:
         if not any(kw in message.upper() for kw in ['LONG', 'SHORT', 'BUY', 'SELL']):
@@ -339,28 +416,121 @@ class TradingBot:
             return
         
         try:
-            entity = await self.client.get_entity(context.args[0])
+            channel_username = context.args[0]
+            logger.info(f"Attempting to add channel: {channel_username}")
+            
+            entity = await self.client.get_entity(channel_username)
             if isinstance(entity, Channel):
-                self.monitored_channels.append(entity)
-                await update.message.reply_text(f"Channel {context.args[0]} added!")
+                if entity not in self.monitored_channels:
+                    self.monitored_channels.append(entity)
+                    await update.message.reply_text(
+                        f"✅ Channel {channel_username} added successfully!\n"
+                        f"Use /list_channels to see all monitored channels"
+                    )
+                else:
+                    await update.message.reply_text("This channel is already being monitored!")
+            else:
+                await update.message.reply_text("❌ Error: This is not a valid channel")
+        except ValueError as e:
+            await update.message.reply_text(f"❌ Invalid channel username: {str(e)}")
         except Exception as e:
-            await update.message.reply_text(f"Error: {e}")
+            logger.error(f"Error adding channel {context.args[0]}: {str(e)}")
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            
+    async def cmd_list_channels(self, update, context):
+        if not self.monitored_channels:
+            await update.message.reply_text("No channels are currently being monitored.")
+            return
+            
+        channels_list = "\n".join(f"- {channel.username or channel.title}" 
+                                for channel in self.monitored_channels)
+        await update.message.reply_text(
+            f"📊 Monitored Channels:\n{channels_list}"
+        )
+        
+    async def cmd_check_connection(self, update, context):
+        status = []
+        
+        # Check Telegram client
+        try:
+            if await self.client.is_user_authorized():
+                me = await self.client.get_me()
+                status.append(f"✅ Telegram Client: Connected as {me.first_name}")
+            else:
+                status.append("❌ Telegram Client: Not authorized")
+        except Exception as e:
+            status.append(f"❌ Telegram Client Error: {str(e)}")
+            
+        # Check OpenAI
+        try:
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-4",
+                messages=[{"role": "user", "content": "test"}],
+                max_tokens=5
+            )
+            status.append("✅ OpenAI API: Connected")
+        except Exception as e:
+            status.append(f"❌ OpenAI API Error: {str(e)}")
+            
+        # Report status
+        await update.message.reply_text("\n".join(status))
 
     async def run(self):
-        if not all([self.bot_token, self.openai_key, self.api_id, self.api_hash, self.phone]):
-            logger.error("Missing environment variables!")
-            return
+        try:
+            # Validate environment variables
+            if not all([self.bot_token, self.openai_key, self.api_id, self.api_hash, self.phone]):
+                logger.error("Missing environment variables! Please check your .env file")
+                return
 
-        @self.client.on(events.NewMessage())
-        async def handle_message(event):
-            if any(event.chat_id == channel.id for channel in self.monitored_channels):
-                signal = await self.analyze_message(event.message.message)
-                if signal:
-                    await self.handle_signal(signal)
+            # Initialize Telegram client with error handling
+            try:
+                logger.info("Starting Telegram client...")
+                await self.client.connect()
+                
+                if not await self.client.is_user_authorized():
+                    logger.info("First time login, sending code request...")
+                    await self.client.send_code_request(self.phone)
+                    logger.info("Please check your Telegram app for the code and run the bot again")
+                    return
+                
+                logger.info("Successfully connected to Telegram!")
+            except Exception as e:
+                logger.error(f"Failed to initialize Telegram client: {str(e)}")
+                return
 
-        await self.client.start(phone=self.phone)
-        admin_task = asyncio.create_task(self.admin_app.initialize())
-        await asyncio.gather(admin_task, self.client.run_until_disconnected())
+            # Set up message handler
+            @self.client.on(events.NewMessage())
+            async def handle_message(event):
+                try:
+                    if any(event.chat_id == channel.id for channel in self.monitored_channels):
+                        logger.info(f"Received message from monitored channel: {event.message.text[:100]}...")
+                        signal = await self.analyze_message(event.message.message)
+                        if signal:
+                            logger.info(f"Valid trading signal detected for {signal.symbol}")
+                            await self.handle_signal(signal)
+                except Exception as e:
+                    logger.error(f"Error processing message: {str(e)}")
+
+            # Initialize admin bot
+            try:
+                logger.info("Starting admin bot...")
+                admin_task = asyncio.create_task(self.admin_app.initialize())
+                logger.info("Admin bot started successfully!")
+            except Exception as e:
+                logger.error(f"Failed to start admin bot: {str(e)}")
+                return
+
+            logger.info("🚀 Trading bot is ready and monitoring channels!")
+            
+            # Run both clients
+            await asyncio.gather(
+                admin_task,
+                self.client.run_until_disconnected()
+            )
+            
+        except Exception as e:
+            logger.error(f"Critical error in bot execution: {str(e)}")
+            raise
 
 if __name__ == "__main__":
     bot = TradingBot()
